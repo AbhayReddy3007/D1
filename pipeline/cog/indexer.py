@@ -102,11 +102,12 @@ _MAX_UPLOAD_RETRIES        = 3
 _MAX_EMBED_RETRIES         = 3
 _GEMINI_FILE_SIZE_LIMIT_MB = 2000
 
-# Max concurrent patent-processing tasks.  Each task does GCS download +
-# Gemini upload + text extraction + date extraction + embedding + AlloyDB
-# write.  Too many in parallel can hit Gemini rate limits; 5 is a safe
-# default.  Override via INDEXER_CONCURRENCY env var.
-MAX_CONCURRENCY = int(os.getenv("INDEXER_CONCURRENCY", "2"))
+# Max concurrent patent-processing tasks per drug.
+# Each task does: GCS download → Gemini upload → text extraction →
+# date extraction → embedding → AlloyDB write.
+# 10 tasks run in parallel for each drug, controlled by asyncio.Semaphore.
+# Override via INDEXER_CONCURRENCY env var if needed.
+MAX_CONCURRENCY = int(os.getenv("INDEXER_CONCURRENCY", "10"))
 
 # Cover page render DPI — higher values produce sharper images for
 # Gemini Vision to read small-font fields like "(22) Filed:" and
@@ -514,10 +515,6 @@ async def extract_dates_from_pdf(file_path: str, filename: str) -> Dict:
 
     Strategy (4-tier fallback):
       1. Upload the raw PDF to Gemini and ask it to extract dates directly.
-         This is the most reliable approach because Gemini can natively
-         parse PDFs — including scanned/image-only ones with unselectable
-         text. It sees the original vector paths and embedded fonts that
-         PyMuPDF's get_text() cannot decode.
       2. If the PDF upload fails or returns no dates, render the first 2
          cover pages as high-DPI PNGs and send them to Gemini Vision.
       3. If vision fails and PyMuPDF can extract text → text-based prompt.
@@ -531,15 +528,11 @@ async def extract_dates_from_pdf(file_path: str, filename: str) -> Dict:
     loop = asyncio.get_running_loop()
 
     # ── Step 1: Native PDF upload to Gemini ──────────────────────────
-    # This handles scanned/image-only PDFs where text is unselectable
-    # because Gemini processes the PDF natively (not via rendered image).
     print(f"[DATE EXTRACTION] Trying native PDF upload for {filename}...")
     try:
         pdf_bytes = Path(file_path).read_bytes()
-        # Only send first ~2MB to keep it fast (cover pages are at the start)
         max_bytes = 2 * 1024 * 1024
         if len(pdf_bytes) > max_bytes:
-            # Use PyMuPDF to extract just the first 2 pages into a new PDF
             try:
                 import fitz
                 doc = fitz.open(file_path)
@@ -551,7 +544,6 @@ async def extract_dates_from_pdf(file_path: str, filename: str) -> Dict:
                 doc.close()
                 print(f"[DATE EXTRACTION] Trimmed PDF to first 2 pages ({len(pdf_bytes)} bytes)")
             except ImportError:
-                # pymupdf not available — send full PDF if under limit
                 if len(pdf_bytes) > 5 * 1024 * 1024:
                     print(f"[DATE EXTRACTION] PDF too large for native upload without pymupdf, skipping")
                     pdf_bytes = None
@@ -586,7 +578,6 @@ async def extract_dates_from_pdf(file_path: str, filename: str) -> Dict:
         print(f"[DATE EXTRACTION] Cover page render failed for {filename}: {e}")
 
     if png_list:
-        # Build contents with all rendered pages
         contents = []
         for i, png_bytes in enumerate(png_list):
             contents.append(
@@ -612,15 +603,7 @@ async def _extract_dates_fallback(
 ) -> Dict:
     """
     Fallback date extraction for when the primary methods fail.
-
-    Strategy (in order):
-      1. Try pymupdf text extraction from first 2 pages → Gemini text prompt
-         (works for text-layer PDFs, fast and cheap)
-      2. If PDF is image-only (no text layer), use OCR-via-Gemini-Vision
-         with a more explicit prompt and all rendered pages.
-      3. If pymupdf is missing entirely, use OCR-via-vision as well.
     """
-    # ── Try text extraction first ──────────────────────────────────
     cover_text = ""
     pymupdf_available = True
     try:
@@ -635,7 +618,6 @@ async def _extract_dates_fallback(
         print(f"[DATE EXTRACTION] Text extraction from PDF failed for {filename}: {e}")
 
     if cover_text.strip():
-        # Has embedded text — use text-based prompt
         dates = await _call_gemini_for_dates(
             contents=[DATE_EXTRACTION_TEXT_PROMPT + cover_text[:3000]],
             filename=filename,
@@ -646,7 +628,6 @@ async def _extract_dates_fallback(
     else:
         print(f"[DATE EXTRACTION] PDF is image-only (no text layer) — using OCR fallback for {filename}")
 
-    # ── OCR-via-Vision fallback ────────────────────────────────────
     if not png_list:
         if not pymupdf_available:
             print(f"[ERROR] pymupdf not available and no cover image — cannot extract dates for {filename}")
@@ -663,7 +644,6 @@ async def _extract_dates_fallback(
     if not png_list:
         return {"filing_date": None, "grant_date": None}
 
-    # Build contents with all rendered pages for OCR
     contents = []
     for png_bytes in png_list:
         contents.append(
@@ -806,11 +786,9 @@ def get_dates_from_chromadb(collection, filename: str) -> dict:
     Priority:
       1. Sentinel record (chunk_index = -1)
       2. First chunk (chunk_index = 0) — fallback, also carries dates
-    Both contain dates for all patents indexed after this update.
     """
     file_hash = hashlib.md5(filename.encode()).hexdigest()
 
-    # 1. Sentinel
     try:
         sid    = file_hash + "_complete"
         result = collection.get(ids=[sid], include=["metadatas"])
@@ -823,7 +801,6 @@ def get_dates_from_chromadb(collection, filename: str) -> dict:
     except Exception as e:
         print(f"[DATES] Sentinel read failed for {filename}: {e}")
 
-    # 2. First chunk fallback
     try:
         result = collection.get(ids=[f"{file_hash}_chunk_0"], include=["metadatas"])
         if result["metadatas"]:
@@ -853,14 +830,8 @@ async def index_text(
     """
     Chunk and index a patent into AlloyDB.
 
-    Dates are stored in:
-      - EVERY chunk's metadata  -> copies carry dates automatically
-      - The sentinel record     -> fast date lookup
-
-    No post-indexing backfill needed.
-
-    AlloyDB writes are serialized via _chroma_write_lock to prevent
-    concurrent-write issues.
+    Dates are stored in every chunk's metadata and the sentinel record.
+    AlloyDB writes are serialized via _chroma_write_lock.
     """
     file_hash   = hashlib.md5(filename.encode()).hexdigest()
     sentinel_id = f"{file_hash}_complete"
@@ -894,7 +865,6 @@ async def index_text(
     filing_date = _clean_date(dates.get("filing_date")) or ""
     grant_date  = _clean_date(dates.get("grant_date"))  or ""
 
-    # Store dates in every chunk so cross-collection copies carry them
     async with _chroma_write_lock:
         collection.add(
             documents  = chunks,
@@ -913,7 +883,6 @@ async def index_text(
             ids=[f"{file_hash}_chunk_{i}" for i in range(len(chunks))],
         )
 
-        # Sentinel — completeness guard + dates
         collection.add(
             documents  = ["__index_complete__"],
             embeddings = [[0.0] * len(embeddings[0])],
@@ -963,8 +932,6 @@ async def copy_from_collection(
     """
     Copies all chunks + sentinel from source to target collection.
     Dates are embedded in chunk metadata so they transfer automatically.
-
-    AlloyDB writes are serialized via _chroma_write_lock.
     """
     try:
         source    = chroma_client.get_collection(source_name)
@@ -1022,13 +989,10 @@ async def fix_dates_for_file(
     """
     Re-extract dates for a single patent and update all its records
     in AlloyDB in-place (no re-embedding needed).
-
-    Returns True if dates were successfully fixed.
     """
     file_hash   = hashlib.md5(filename.encode()).hexdigest()
     sentinel_id = f"{file_hash}_complete"
 
-    # Check if already has valid dates
     try:
         result = collection.get(ids=[sentinel_id], include=["metadatas"])
         if result["metadatas"] and _has_valid_dates(result["metadatas"][0]):
@@ -1041,8 +1005,7 @@ async def fix_dates_for_file(
     except Exception:
         pass
 
-    # Re-extract dates
-    dates = await extract_dates_from_pdf(file_path, filename)
+    dates  = await extract_dates_from_pdf(file_path, filename)
     filing = _clean_date(dates.get("filing_date")) or ""
     grant  = _clean_date(dates.get("grant_date"))  or ""
 
@@ -1050,7 +1013,6 @@ async def fix_dates_for_file(
         print(f"[FIX-DATES] Still could not extract dates for {filename}")
         return False
 
-    # Update all records in-place
     try:
         all_records = collection.get(
             where={"filename": filename},
@@ -1098,13 +1060,11 @@ async def _process_single_patent(
     """
     filename = ref["filename"]
 
-    # ── Skip if already completed in this batch (crash resume) ──────
     if completed is not None and filename in completed:
         print(f"[RESUME] {filename} — already completed in previous run, skipping")
         return {"filename": filename, "path": None, "tmp_dir": None}
 
     async with semaphore:
-        # ── Already indexed — check if dates are present ─────────────
         if not reindex and sentinel_exists(collection, filename):
             existing_dates = get_dates_from_chromadb(collection, filename)
             filing = existing_dates.get("filing_date")
@@ -1114,7 +1074,6 @@ async def _process_single_patent(
                     _mark_completed(drug_name, filename, completed)
                 return {"filename": filename, "path": None, "tmp_dir": None}
 
-            # Filing date is missing — re-extract
             print(f"[FIX-DATES] {filename} — indexed but missing filing date, re-extracting...")
             loop = asyncio.get_running_loop()
             pf = await loop.run_in_executor(
@@ -1140,7 +1099,6 @@ async def _process_single_patent(
                 _mark_completed(drug_name, filename, completed)
             return {"filename": filename, "path": None, "tmp_dir": None}
 
-        # ── Cross-collection copy ────────────────────────────────────
         if not reindex:
             source_col = find_in_any_collection(filename)
             if source_col:
@@ -1150,7 +1108,6 @@ async def _process_single_patent(
                     _mark_completed(drug_name, filename, completed)
                 return {"filename": filename, "path": None, "tmp_dir": None}
 
-        # ── Full index: download → upload → text+dates → store ──────
         print(f"[INDEX] {filename} — downloading...")
         loop = asyncio.get_running_loop()
         pf = await loop.run_in_executor(
@@ -1167,7 +1124,6 @@ async def _process_single_patent(
                 print(f"[WARNING] Upload failed for {filename}")
                 return pf
 
-            # Text extraction and date extraction run in parallel
             text, dates = await asyncio.gather(
                 extract_text_via_gemini(uploaded_file, filename),
                 extract_dates_from_pdf(pf["path"], filename),
@@ -1175,15 +1131,12 @@ async def _process_single_patent(
 
             if text:
                 await index_text(drug_name, filename, text, collection, dates=dates)
-                # Mark completed only after successful indexing (sentinel written)
                 if completed is not None:
                     _mark_completed(drug_name, filename, completed)
             else:
                 print(f"[WARNING] No text extracted from {filename}")
 
             await cleanup_uploaded_file(uploaded_file)
-
-            # Small stagger to avoid Gemini rate-limit spikes across tasks
             await asyncio.sleep(0.5 + random.uniform(0, 0.5))
 
         except Exception as e:
@@ -1212,47 +1165,40 @@ async def run_indexing(
     """
     Index multiple patents **in parallel** (bounded by *max_concurrency*).
 
-    **Crash-resilient**: Progress is tracked in a JSON file on disk.
-    If the process crashes mid-batch, restarting will automatically
-    skip patents that were already successfully processed.
+    Default concurrency is 10 — meaning 10 patents per drug are processed
+    simultaneously (download → upload → text+dates → embed → store).
+    Override via the INDEXER_CONCURRENCY env var or by passing max_concurrency
+    directly.
+
+    Crash-resilient: progress is tracked in a JSON file on disk.
+    If the process crashes mid-batch, restarting will skip already-completed patents.
 
     For each PDF ref:
       1. Skip if already completed in a previous (crashed) run
       2. Skip if already indexed AND has valid dates
-      3. If indexed but missing filing date → re-download, re-extract dates,
-         update in-place (no re-embedding)
+      3. If indexed but missing filing date → re-download, re-extract, update in-place
       4. Copy from another collection if found — dates transfer automatically
-      5. Download from GCS -> upload to Gemini -> extract text + dates in parallel -> index
+      5. Download → upload → extract text + dates in parallel → index
 
-    Dates are stored upfront during indexing.
-    No backfill step is needed or performed.
-
-    Parallelism is controlled by an asyncio.Semaphore so at most
-    *max_concurrency* patents are being processed simultaneously.
-    This prevents Gemini API rate-limit errors while still providing
-    significant speedup over sequential processing.
-
-    AlloyDB writes are serialized internally via an asyncio.Lock
-    (_chroma_write_lock) so concurrent tasks don't corrupt the DB.
+    AlloyDB writes are serialized internally via _chroma_write_lock.
 
     Args:
         drug_name:       Drug name string
         pdf_refs:        List of {"filename": str, "blob_name": str} from gcs_lister
         collection:      AlloyDB collection object
         reindex:         If True, force re-indexing even if sentinel exists
-        max_concurrency: Max patents processed in parallel (default: MAX_CONCURRENCY)
+        max_concurrency: Max patents processed in parallel (default: 10)
 
     Returns:
         List of {"filename": str, "path": str | None, "tmp_dir": str | None}
     """
-    # ── Load crash-resume progress ──────────────────────────────────
-    completed = _load_progress(drug_name) if not reindex else set()
+    completed    = _load_progress(drug_name) if not reindex else set()
     already_done = sum(1 for r in pdf_refs if r["filename"] in completed)
     remaining    = len(pdf_refs) - already_done
 
     print(
-        f"\n[INDEXER] Processing {len(pdf_refs)} file(s) "
-        f"with max concurrency = {max_concurrency}..."
+        f"\n[INDEXER] '{drug_name}': {len(pdf_refs)} patent(s), "
+        f"{max_concurrency} running in parallel..."
     )
     if already_done > 0:
         print(
@@ -1270,7 +1216,6 @@ async def run_indexing(
         for ref in pdf_refs
     ]
 
-    # asyncio.gather preserves order — results[i] corresponds to pdf_refs[i]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     downloaded_files: List[dict] = []
@@ -1282,7 +1227,6 @@ async def run_indexing(
         else:
             downloaded_files.append(result)
 
-    # ── If ALL patents completed, clear the progress file ───────────
     all_filenames = {r["filename"] for r in pdf_refs}
     if all_filenames.issubset(completed):
         _clear_progress(drug_name)
