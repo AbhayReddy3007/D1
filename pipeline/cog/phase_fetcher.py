@@ -2,7 +2,7 @@
 phase_fetcher.py
 ─────────────────
 Handles:
-  - Fetching clinical development stage from BigQuery
+  - Fetching clinical development stage from BigQuery (clinical_efficacy table)
   - Loading fallback phase data from a local Excel sheet
   - Merging BQ + fallback stages per jurisdiction (US / EP)
   - Assigning phase_at_filing to each patent dict
@@ -92,7 +92,6 @@ def canonicalise_drug_name(drug_name: str) -> str:
     return drug_name
 
 
-
 def _highest_phase(a: Optional[str], b: Optional[str]) -> Optional[str]:
     """Returns whichever phase is further along. None is lower than any real stage."""
     if a is None:
@@ -113,6 +112,20 @@ def import_from_gbq(
     dataset_id:           str,
     service_account_path: Optional[str] = None,
 ) -> pd.DataFrame:
+    """
+    Fetches clinical phase data from the `clinical_efficacy` table.
+
+    Column mapping:
+        molecule_name   → cleaned_generic_name
+        trial_location  → Drug_Geography  (comma-separated countries, split into rows)
+        phase           → highest_development_stage
+
+    Phase normalisation:
+        1, 1a, 1b, Phase 1, Phase I  → 'Phase I'
+        2, 2a, 2b, Phase 2, Phase II → 'Phase II'
+        3, 3a, 3b, Phase 3, Phase III→ 'Phase III'
+        4, Phase 4                   → 'Marketed'
+    """
     try:
         if service_account_path:
             credentials = service_account.Credentials.from_service_account_file(
@@ -128,22 +141,34 @@ def import_from_gbq(
         query = f"""
         WITH filtered AS (
           SELECT
-            cleaned_generic_name,
-            Drug_Geography,
-            highest_development_stage,
-            CASE LOWER(highest_development_stage)
-              WHEN 'marketed'         THEN 5
-              WHEN 'pre-registration' THEN 4
-              WHEN 'phase iii'        THEN 3
-              WHEN 'phase ii'         THEN 2
-              WHEN 'phase i'          THEN 1
+            molecule_name                                AS cleaned_generic_name,
+            TRIM(trial_location_part)                    AS Drug_Geography,
+            CASE
+              WHEN REGEXP_CONTAINS(LOWER(TRIM(phase)), r'^4')   THEN 'Marketed'
+              WHEN REGEXP_CONTAINS(LOWER(TRIM(phase)), r'^iii') THEN 'Phase III'
+              WHEN REGEXP_CONTAINS(LOWER(TRIM(phase)), r'^3')   THEN 'Phase III'
+              WHEN REGEXP_CONTAINS(LOWER(TRIM(phase)), r'^ii')  THEN 'Phase II'
+              WHEN REGEXP_CONTAINS(LOWER(TRIM(phase)), r'^2')   THEN 'Phase II'
+              WHEN REGEXP_CONTAINS(LOWER(TRIM(phase)), r'^i')   THEN 'Phase I'
+              WHEN REGEXP_CONTAINS(LOWER(TRIM(phase)), r'^1')   THEN 'Phase I'
+              ELSE TRIM(phase)
+            END                                          AS highest_development_stage,
+            CASE
+              WHEN REGEXP_CONTAINS(LOWER(TRIM(phase)), r'^4')   THEN 5
+              WHEN REGEXP_CONTAINS(LOWER(TRIM(phase)), r'^iii') THEN 3
+              WHEN REGEXP_CONTAINS(LOWER(TRIM(phase)), r'^3')   THEN 3
+              WHEN REGEXP_CONTAINS(LOWER(TRIM(phase)), r'^ii')  THEN 2
+              WHEN REGEXP_CONTAINS(LOWER(TRIM(phase)), r'^2')   THEN 2
+              WHEN REGEXP_CONTAINS(LOWER(TRIM(phase)), r'^i')   THEN 1
+              WHEN REGEXP_CONTAINS(LOWER(TRIM(phase)), r'^1')   THEN 1
               ELSE 0
-            END AS stage_rank
-          FROM `{fq_table}`
+            END                                          AS stage_rank
+          FROM `{fq_table}`,
+          UNNEST(SPLIT(trial_location, ',')) AS trial_location_part
           WHERE LOWER(REGEXP_REPLACE(
-                  COALESCE(cleaned_generic_name, ''),
-                  r'[\\s\\-_]+', ''
-                )) = LOWER(REGEXP_REPLACE(@drug_name, r'[\\s\\-_]+', ''))
+                  COALESCE(molecule_name, ''),
+                  r'[\s\-_]+', ''
+                )) = LOWER(REGEXP_REPLACE(@drug_name, r'[\s\-_]+', ''))
         ),
         ranked AS (
           SELECT
@@ -547,6 +572,7 @@ def _parse_phase_number(phase_str: str) -> Optional[float]:
     Handles: 'Phase 1', 'Phase 2', 'Phase 3', '3a', '3b', 'Marketed',
              'Pre-registration', 'Preclinical', 'I', 'II', 'III', etc.
     Sub-phases like 3a/3b are treated as 3.
+    Phase 4 is treated as Marketed (5.0).
     Returns None if unparseable.
     """
     s = str(phase_str).strip().lower()
@@ -566,6 +592,10 @@ def _parse_phase_number(phase_str: str) -> Optional[float]:
     # Strip "phase" prefix
     cleaned = re.sub(r"^phase\s*", "", s).strip()
 
+    # Phase 4 → Marketed
+    if re.match(r"^4", cleaned):
+        return 5.0
+
     # Try roman numerals (e.g. "III", "IIa")
     roman_match = re.match(r"^(i{1,3}v?)\s*[a-z]?\s*$", cleaned, re.IGNORECASE)
     if roman_match:
@@ -575,7 +605,11 @@ def _parse_phase_number(phase_str: str) -> Optional[float]:
     # Try numeric (e.g. "3", "3a", "3b", "2/3")
     num_match = re.match(r"^(\d)", cleaned)
     if num_match:
-        return float(num_match.group(1))
+        num = int(num_match.group(1))
+        # Phase 4 → Marketed rank
+        if num >= 4:
+            return 5.0
+        return float(num)
 
     return None
 
@@ -607,6 +641,7 @@ def _build_phase_year_lookup(
         EU / Europe / European Union / any EU country name  → EP
 
     Phase sub-phases (3a, 3b) are treated as their base phase (3).
+    Phase 4 is treated as Marketed.
     For each jurisdiction + year, only the highest phase is kept.
 
     Returns:
